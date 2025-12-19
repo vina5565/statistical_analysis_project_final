@@ -2,6 +2,8 @@
 covid_engine.py
 Raw(TXT + grades Excel) -> processed tables -> analysis results in one run.
 
+이 코드는 raw 데이터를 읽어들여 코로나 그룹과 아닌 그룹으로 나누고 매개분석을 진행합니다. 
+
 Usage example:
   python covid_engine.py \
     --raw_txt_dir data/raw \
