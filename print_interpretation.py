@@ -87,6 +87,21 @@ def _normalize_text(s) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
+def normalize_sid(x) -> str:
+    """
+    student_id 정규화:
+    - 201611091.0 -> 201611091
+    - 공백 제거
+    - 혹시 섞인 문자 있으면 숫자만 추출
+    """
+    if pd.isna(x):
+        return ""
+    s = str(x).strip()
+    s = re.sub(r"\.0$", "", s)           # float로 읽힌 학번 처리
+    m = re.search(r"(\d{6,})", s)        # 최소 6자리 이상 숫자 추출
+    return m.group(1) if m else s
+
+
 def _keyword_count(text: str, keywords: list[str]) -> int:
     if not text:
         return 0
@@ -265,13 +280,13 @@ def print_ols(df_ols_raw: pd.DataFrame, alpha: float, top_k: int) -> None:
 def print_seteuk_keyword_analysis(results_dir: Path, alpha: float, top_k: int) -> None:
     """
     out/processed/seteuk.csv + student_info.csv를 읽어서
-    세특 키워드 빈도 지표를 만들고 2그룹 비교 결과를 출력
+    세특 키워드(이미 계산된 컬럼)를 학생별로 집계한 뒤 2그룹 비교 결과 출력
     """
     processed_dir = results_dir.parent / "processed"  # out/results -> out/processed
     seteuk_path = processed_dir / "seteuk.csv"
     students_path = processed_dir / "student_info.csv"
 
-    print_header("3) 세특 키워드 빈도 비교 (TXT 세특 기반)")
+    print_header("3) 세특 키워드 빈도 비교 (seteuk.csv 기반)")
 
     if not seteuk_path.exists() or not students_path.exists():
         print("※ 필요한 파일이 없습니다.")
@@ -282,61 +297,94 @@ def print_seteuk_keyword_analysis(results_dir: Path, alpha: float, top_k: int) -
     df_seteuk = pd.read_csv(seteuk_path)
     df_students = pd.read_csv(students_path)
 
-    # group 컬럼이 없으면(=covid_engine이 저장한 processed에는 group이 없을 수도 있음)
-    # results에 저장된 그룹 정의를 재현할 정보가 부족하므로 우선 종료
-    # -> 해결: covid_engine에서 student_info.csv에 group 저장하거나, 여기에서 cohort로 재계산
+    # --- group 만들기(없으면 cohort/졸업연도 기반)
     if "group" not in df_students.columns:
-        # cohort 기반으로 재계산 시도 (가장 안전한 기본)
         if "cohort" in df_students.columns:
             df_students["group"] = (df_students["cohort"].astype(str) == "COVID").astype(int)
         elif "hs_graduation_year" in df_students.columns:
             df_students["group"] = (pd.to_numeric(df_students["hs_graduation_year"], errors="coerce") >= 2021).astype(int)
         else:
             print("※ student_info.csv에 group/cohort/hs_graduation_year 컬럼이 없어 그룹을 만들 수 없습니다.")
-            print("  해결: covid_engine에서 student_info.csv에 group 컬럼을 저장하거나, group 생성 규칙 컬럼을 추가해 주세요.")
             return
 
     if "student_id" not in df_seteuk.columns or "student_id" not in df_students.columns:
         print("※ student_id 컬럼이 없어 병합할 수 없습니다.")
         return
 
-    text_col = _find_text_column(df_seteuk)
-    df_seteuk[text_col] = df_seteuk[text_col].map(_normalize_text)
+    # ✅ 핵심: student_id 정규화(201611091.0 문제 해결)
+    df_students["student_id"] = df_students["student_id"].apply(normalize_sid)
+    df_seteuk["student_id"] = df_seteuk["student_id"].apply(normalize_sid)
 
-    # 학생별 세특 텍스트 합치기
-    agg = df_seteuk.groupby("student_id")[text_col].apply(lambda x: " ".join(x)).reset_index()
-    agg["text_len"] = agg[text_col].str.len().astype(float).clip(lower=1.0)
+    # --- seteuk.csv가 이미 키워드 카운트/빈도 컬럼을 갖고 있으면 그걸 그대로 사용
+    required_cols = {
+        "exploration_keyword_count",
+        "online_keyword_count",
+        "qualitative_keyword_count",
+        "kw_freq_exploration",
+        "kw_freq_online",
+        "kw_freq_qualitative",
+        "content_length",
+    }
 
-    # 키워드 카운트 & 1000자당 정규화
-    for key, kws in KEYWORDS.items():
-        agg[f"{key}_cnt"] = agg[text_col].apply(lambda t: _keyword_count(t, kws)).astype(float)
-        agg[f"{key}_per1k"] = (agg[f"{key}_cnt"] / agg["text_len"]) * 1000.0
+    if not required_cols.issubset(set(df_seteuk.columns)):
+        # fallback: 기존 텍스트 기반(너 KEYWORDS 로직)으로 계산
+        # (근데 너 CSV는 이미 컬럼이 있으니 보통 여기 안 들어감)
+        text_col = _find_text_column(df_seteuk)
+        df_seteuk[text_col] = df_seteuk[text_col].map(_normalize_text)
 
-    # 분석 테이블 생성
-    df = df_students[["student_id", "group"]].astype({"student_id": str}).merge(
-        agg.astype({"student_id": str}),
-        on="student_id",
-        how="inner"
-    )
+        agg = df_seteuk.groupby("student_id")[text_col].apply(lambda x: " ".join(x)).reset_index()
+        agg["text_len"] = agg[text_col].str.len().astype(float).clip(lower=1.0)
 
-    # 비교할 지표들
-    metrics = [
-        "exp_inquiry_cnt", "exp_inquiry_per1k",
-        "online_data_cnt", "online_data_per1k",
-        "text_len",
-    ]
+        for key, kws in KEYWORDS.items():
+            agg[f"{key}_cnt"] = agg[text_col].apply(lambda t: _keyword_count(t, kws)).astype(float)
+            agg[f"{key}_per1k"] = (agg[f"{key}_cnt"] / agg["text_len"]) * 1000.0
 
+        df = df_students[["student_id", "group"]].merge(agg, on="student_id", how="inner")
+
+        metrics = ["exp_inquiry_cnt", "exp_inquiry_per1k", "online_data_cnt", "online_data_per1k", "text_len"]
+
+    else:
+        # ✅ 추천 루트: seteuk.csv의 계산 결과를 학생별로 집계
+        per_student = df_seteuk.groupby("student_id", as_index=False).agg({
+            "exploration_keyword_count": "sum",
+            "online_keyword_count": "sum",
+            "qualitative_keyword_count": "sum",
+            "kw_freq_exploration": "mean",
+            "kw_freq_online": "mean",
+            "kw_freq_qualitative": "mean",
+            "content_length": "sum",
+        })
+
+        # 병합
+        df = df_students[["student_id", "group"]].merge(per_student, on="student_id", how="inner")
+
+        # 비교할 지표
+        metrics = [
+            "exploration_keyword_count",
+            "online_keyword_count",
+            "qualitative_keyword_count",
+            "kw_freq_exploration",
+            "kw_freq_online",
+            "kw_freq_qualitative",
+            "content_length",
+        ]
+
+    # ---- DEBUG (원하면 지워도 됨)
+    print(f"[DEBUG] students={len(df_students)}, seteuk={len(df_seteuk)}, merged={len(df)}")
+    if len(df) == 0:
+        print("※ 병합 결과가 0행입니다. student_id 정규화가 여전히 맞지 않거나, 두 파일의 학번 집합이 다릅니다.")
+        print("  - student_info student_id 예시:", df_students["student_id"].head(5).tolist())
+        print("  - seteuk student_id 예시:", df_seteuk["student_id"].head(5).tolist())
+        return
+
+    # ---- stats
     rows = []
     for m in metrics:
         if m in df.columns:
             rows.append(_two_group_stats(df, m, group_col="group"))
 
-    if not rows:
-        print("※ 세특 지표를 만들지 못했습니다. seteuk.csv 텍스트 컬럼/내용을 확인해 주세요.")
-        return
-
     out = pd.DataFrame(rows)
-    # 유의한 것만 top_k
+
     out["sig"] = pd.to_numeric(out["p"], errors="coerce").lt(alpha)
     out = out.sort_values(["p", "metric"], ascending=[True, True])
 
@@ -349,37 +397,36 @@ def print_seteuk_keyword_analysis(results_dir: Path, alpha: float, top_k: int) -
 
     if sig_df.empty:
         print(f"※ p < {alpha} 기준으로 유의한 세특 키워드 지표가 없습니다.")
-        # 그래도 전체 요약 1줄 정도는 보여주기
-        for _, r in out.head(min(5, len(out))).iterrows():
+        # 그래도 상위 7개 정도 요약 출력
+        for _, r in out.head(min(7, len(out))).iterrows():
             print(f"- {r['metric']}: p={r['p']:.4g}, diff={r['diff']:.4g}")
-        return
+    else:
+        print(f"※ 유의 지표 TOP {min(top_k, len(sig_df))}")
+        for _, r in sig_df.iterrows():
+            metric = r["metric"]
+            n0, n1 = r["n0"], r["n1"]
+            mean0, mean1 = r["mean0"], r["mean1"]
+            diff = r["diff"]
+            p = r["p"]
+            bf_p = r["bf_p"]
+            g = r["hedges_g"]
 
-    print(f"※ 유의 지표 TOP {min(top_k, len(sig_df))}")
-    for _, r in sig_df.iterrows():
-        metric = r["metric"]
-        n0, n1 = r["n0"], r["n1"]
-        mean0, mean1 = r["mean0"], r["mean1"]
-        diff = r["diff"]
-        p = r["p"]
-        bf_p = r["bf_p"]
-        g = r["hedges_g"]
+            direction = _direction_from_diff(diff)
+            effect = _effect_label(g)
 
-        # 기존 라벨 재사용
-        direction = _direction_from_diff(diff)
-        effect = _effect_label(g)
+            print(f"- 지표: {metric}")
+            print(f"  · 방법: Welch t-test(평균 차이), Brown-Forsythe(분산 차이), Hedges' g(효과크기)")
+            print(f"  · 표본: n0={n0}, n1={n1}")
+            print(f"  · 평균: mean0={mean0:.4g}, mean1={mean1:.4g}, diff={diff:.4g} ({direction})")
+            print(f"  · 유의성: p={p:.4g}, bf_p={bf_p:.4g}")
+            print(f"  · 효과크기: g={g:.3g} ({effect})")
+            print()
 
-        print(f"- 지표: {metric}")
-        print(f"  · 방법: Welch t-test(평균 차이), Brown-Forsythe(분산 차이), Hedges' g(효과크기)")
-        print(f"  · 표본: n0={n0}, n1={n1}")
-        print(f"  · 평균: mean0={mean0:.4g}, mean1={mean1:.4g}, diff={diff:.4g} ({direction})")
-        print(f"  · 유의성: p={p:.4g}, bf_p={bf_p:.4g}")
-        print(f"  · 효과크기: g={g:.3g} ({effect})")
-        print()
-
-    # 저장(선택): 결과를 csv로 남기기
+    # 저장
     save_path = results_dir / "seteuk_keyword_group_compare.csv"
     out.to_csv(save_path, index=False, encoding="utf-8-sig")
     print(f"(저장) {save_path}")
+
 
 
 def main():
