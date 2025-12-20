@@ -25,6 +25,9 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import pandas as pd
+import re
+import numpy as np
+from scipy import stats
 
 
 def _direction_from_diff(diff: float) -> str:
@@ -49,6 +52,101 @@ def _effect_label(g: float) -> str:
     if ag < 0.8:
         return "중간"
     return "큼"
+
+# -----------------------------
+# 세특 키워드 사전(필요시 수정)
+# -----------------------------
+KEYWORDS = {
+    "exp_inquiry": [
+        "실험", "탐구", "탐색", "가설", "검증", "관찰", "측정", "분석", "결과", "변인",
+        "연구", "프로젝트", "설계", "자료수집", "데이터수집", "보고서", "발표", "토의"
+    ],
+    "online_data": [
+        "온라인", "비대면", "원격", "줌", "zoom", "구글", "클래스룸", "lms",
+        "데이터", "코딩", "파이썬", "python", "엑셀", "스프레드시트", "통계", "시각화",
+        "모델", "머신러닝", "ai", "크롤링", "설문", "폼", "form"
+    ],
+}
+
+def _find_text_column(df: pd.DataFrame) -> str:
+    """seteuk.csv에서 텍스트 컬럼 자동 탐지"""
+    candidates = ["text", "content", "seteuk_text", "body", "memo", "desc", "sentence"]
+    for c in candidates:
+        if c in df.columns:
+            return c
+    # object 컬럼 중 하나 선택
+    obj_cols = [c for c in df.columns if df[c].dtype == "object"]
+    if not obj_cols:
+        raise ValueError("seteuk.csv에서 텍스트 컬럼을 찾을 수 없습니다.")
+    return obj_cols[0]
+
+def _normalize_text(s) -> str:
+    if pd.isna(s):
+        return ""
+    s = str(s).lower()
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _keyword_count(text: str, keywords: list[str]) -> int:
+    if not text:
+        return 0
+    cnt = 0
+    for kw in keywords:
+        cnt += text.count(kw.lower())
+    return cnt
+
+def _hedges_g(x: np.ndarray, y: np.ndarray) -> float:
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    nx, ny = len(x), len(y)
+    if nx < 2 or ny < 2:
+        return np.nan
+    vx, vy = np.var(x, ddof=1), np.var(y, ddof=1)
+    pooled = np.sqrt(((nx - 1) * vx + (ny - 1) * vy) / (nx + ny - 2))
+    if pooled == 0:
+        return np.nan
+    d = (np.mean(x) - np.mean(y)) / pooled
+    J = 1 - (3 / (4 * (nx + ny) - 9))
+    return float(J * d)
+
+def _two_group_stats(df: pd.DataFrame, metric: str, group_col: str = "group") -> dict:
+    """Welch t-test + Brown-Forsythe + Hedges g (diff=mean1-mean0)"""
+    g0 = df[df[group_col] == 0][metric].dropna().astype(float).to_numpy()
+    g1 = df[df[group_col] == 1][metric].dropna().astype(float).to_numpy()
+
+    # ✅ 어떤 경우에도 컬럼이 존재하도록 기본값 채워두기
+    out = {
+        "metric": metric,
+        "n0": int(len(g0)),
+        "n1": int(len(g1)),
+        "mean0": np.nan,
+        "mean1": np.nan,
+        "diff": np.nan,
+        "bf_p": np.nan,
+        "p": np.nan,
+        "hedges_g": np.nan,
+        "error": "",
+    }
+
+    if len(g0) < 2 or len(g1) < 2:
+        out["error"] = "표본 부족(각 그룹 최소 2개 필요)"
+        return out
+
+    bf_stat, bf_p = stats.levene(g0, g1, center="median")  # Brown-Forsythe
+    t_stat, p = stats.ttest_ind(g1, g0, equal_var=False)   # group1 - group0
+
+    out.update({
+        "mean0": float(np.mean(g0)),
+        "mean1": float(np.mean(g1)),
+        "diff": float(np.mean(g1) - np.mean(g0)),
+        "bf_p": float(bf_p),
+        "p": float(p),
+        "hedges_g": float(_hedges_g(g1, g0)),
+        "error": "",
+    })
+    return out
+
+
 
 
 def load_from_excel(xlsx_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -164,6 +262,125 @@ def print_ols(df_ols_raw: pd.DataFrame, alpha: float, top_k: int) -> None:
         print(f"  · 결과: b_group={b:.4g} ({direction}), p_group={p:.4g}, R²={r2:.3g}, n={n}")
         print()
 
+def print_seteuk_keyword_analysis(results_dir: Path, alpha: float, top_k: int) -> None:
+    """
+    out/processed/seteuk.csv + student_info.csv를 읽어서
+    세특 키워드 빈도 지표를 만들고 2그룹 비교 결과를 출력
+    """
+    processed_dir = results_dir.parent / "processed"  # out/results -> out/processed
+    seteuk_path = processed_dir / "seteuk.csv"
+    students_path = processed_dir / "student_info.csv"
+
+    print_header("3) 세특 키워드 빈도 비교 (TXT 세특 기반)")
+
+    if not seteuk_path.exists() or not students_path.exists():
+        print("※ 필요한 파일이 없습니다.")
+        print(f"  - seteuk.csv: {seteuk_path}")
+        print(f"  - student_info.csv: {students_path}")
+        return
+
+    df_seteuk = pd.read_csv(seteuk_path)
+    df_students = pd.read_csv(students_path)
+
+    # group 컬럼이 없으면(=covid_engine이 저장한 processed에는 group이 없을 수도 있음)
+    # results에 저장된 그룹 정의를 재현할 정보가 부족하므로 우선 종료
+    # -> 해결: covid_engine에서 student_info.csv에 group 저장하거나, 여기에서 cohort로 재계산
+    if "group" not in df_students.columns:
+        # cohort 기반으로 재계산 시도 (가장 안전한 기본)
+        if "cohort" in df_students.columns:
+            df_students["group"] = (df_students["cohort"].astype(str) == "COVID").astype(int)
+        elif "hs_graduation_year" in df_students.columns:
+            df_students["group"] = (pd.to_numeric(df_students["hs_graduation_year"], errors="coerce") >= 2021).astype(int)
+        else:
+            print("※ student_info.csv에 group/cohort/hs_graduation_year 컬럼이 없어 그룹을 만들 수 없습니다.")
+            print("  해결: covid_engine에서 student_info.csv에 group 컬럼을 저장하거나, group 생성 규칙 컬럼을 추가해 주세요.")
+            return
+
+    if "student_id" not in df_seteuk.columns or "student_id" not in df_students.columns:
+        print("※ student_id 컬럼이 없어 병합할 수 없습니다.")
+        return
+
+    text_col = _find_text_column(df_seteuk)
+    df_seteuk[text_col] = df_seteuk[text_col].map(_normalize_text)
+
+    # 학생별 세특 텍스트 합치기
+    agg = df_seteuk.groupby("student_id")[text_col].apply(lambda x: " ".join(x)).reset_index()
+    agg["text_len"] = agg[text_col].str.len().astype(float).clip(lower=1.0)
+
+    # 키워드 카운트 & 1000자당 정규화
+    for key, kws in KEYWORDS.items():
+        agg[f"{key}_cnt"] = agg[text_col].apply(lambda t: _keyword_count(t, kws)).astype(float)
+        agg[f"{key}_per1k"] = (agg[f"{key}_cnt"] / agg["text_len"]) * 1000.0
+
+    # 분석 테이블 생성
+    df = df_students[["student_id", "group"]].astype({"student_id": str}).merge(
+        agg.astype({"student_id": str}),
+        on="student_id",
+        how="inner"
+    )
+
+    # 비교할 지표들
+    metrics = [
+        "exp_inquiry_cnt", "exp_inquiry_per1k",
+        "online_data_cnt", "online_data_per1k",
+        "text_len",
+    ]
+
+    rows = []
+    for m in metrics:
+        if m in df.columns:
+            rows.append(_two_group_stats(df, m, group_col="group"))
+
+    if not rows:
+        print("※ 세특 지표를 만들지 못했습니다. seteuk.csv 텍스트 컬럼/내용을 확인해 주세요.")
+        return
+
+    out = pd.DataFrame(rows)
+    # 유의한 것만 top_k
+    out["sig"] = pd.to_numeric(out["p"], errors="coerce").lt(alpha)
+    out = out.sort_values(["p", "metric"], ascending=[True, True])
+
+    sig_df = out[out["sig"] == True].head(top_k)
+
+    print(f"- 유의수준(alpha) = {alpha}")
+    print("- diff = mean1(코로나) - mean0(비코로나)")
+    print("- p = Welch t-test p-value / bf_p = 분산 차이(Brown-Forsythe) p-value")
+    print()
+
+    if sig_df.empty:
+        print(f"※ p < {alpha} 기준으로 유의한 세특 키워드 지표가 없습니다.")
+        # 그래도 전체 요약 1줄 정도는 보여주기
+        for _, r in out.head(min(5, len(out))).iterrows():
+            print(f"- {r['metric']}: p={r['p']:.4g}, diff={r['diff']:.4g}")
+        return
+
+    print(f"※ 유의 지표 TOP {min(top_k, len(sig_df))}")
+    for _, r in sig_df.iterrows():
+        metric = r["metric"]
+        n0, n1 = r["n0"], r["n1"]
+        mean0, mean1 = r["mean0"], r["mean1"]
+        diff = r["diff"]
+        p = r["p"]
+        bf_p = r["bf_p"]
+        g = r["hedges_g"]
+
+        # 기존 라벨 재사용
+        direction = _direction_from_diff(diff)
+        effect = _effect_label(g)
+
+        print(f"- 지표: {metric}")
+        print(f"  · 방법: Welch t-test(평균 차이), Brown-Forsythe(분산 차이), Hedges' g(효과크기)")
+        print(f"  · 표본: n0={n0}, n1={n1}")
+        print(f"  · 평균: mean0={mean0:.4g}, mean1={mean1:.4g}, diff={diff:.4g} ({direction})")
+        print(f"  · 유의성: p={p:.4g}, bf_p={bf_p:.4g}")
+        print(f"  · 효과크기: g={g:.3g} ({effect})")
+        print()
+
+    # 저장(선택): 결과를 csv로 남기기
+    save_path = results_dir / "seteuk_keyword_group_compare.csv"
+    out.to_csv(save_path, index=False, encoding="utf-8-sig")
+    print(f"(저장) {save_path}")
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -191,6 +408,8 @@ def main():
 
     print_group_compare(df_group, alpha=alpha, top_k=top_k)
     print_ols(df_ols, alpha=alpha, top_k=top_k)
+    base_results_dir = results_dir if not args.excel else Path(args.excel).parent
+    print_seteuk_keyword_analysis(base_results_dir, alpha=alpha, top_k=top_k)
 
     print("=" * 80)
     print("끝.")
